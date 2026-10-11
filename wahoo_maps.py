@@ -1,648 +1,24 @@
 """Small stdlib-only downloader and cautious Wahoo tile synchronizer."""
 import argparse
-import base64
 import contextlib
 import datetime as dt
-import hashlib
-import http.cookiejar
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
 import subprocess
 import sys
-import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 import zipfile
 
-SHARE = 'https://1drv.ms/f/s!AgQ5_SDAjeL0eIUfrjTBE8QWGZc?e=RrEqBF'
-API = 'https://onedrive.live.com/_api/v2.0'
-UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
-COUNTRIES = ('germany', 'poland', 'czech-republic')
-ROOTS = {'map': '/sdcard/maps/tiles/8', 'routing': '/sdcard/maps/routing/2/000'}
-MONTHS = {m.lower(): i for i, m in enumerate(('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'), 1)}
-TERMINAL_JOURNAL_STATES = ('complete', 'recovered', 'legacy_acknowledged', 'orphaned_legacy', 'acknowledged_unresumable')
-
-
-class Error(Exception):
-    pass
-
-
-def sha(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for block in iter(lambda: f.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
-
-
-def save_json(path, data):
-    path = Path(path)
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
-    tmp.replace(path)
-
-
-def human(size):
-    return f'{size / 1024 ** 3:.2f} GiB'
-
-
-def progress(label, current, total):
-    width = 24
-    ratio = current / total if total else 1
-    filled = min(width, int(width * ratio))
-    print(f'\r{label}: [{"#" * filled}{"-" * (width - filled)}] {current}/{total} · {100 * ratio:.0f}%', end='\n' if current >= total else '', flush=True)
-
-
-class Source:
-    def __init__(self, api=API, share=SHARE):
-        self.api, self.share = api, share
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-
-    def open(self, url, headers=None):
-        req = urllib.request.Request(url, headers={'User-Agent': UA, **(headers or {})})
-        try:
-            return self.opener.open(req, timeout=90)
-        except urllib.error.HTTPError as e:
-            raise Error(f'HTTP {e.code}; source request failed (session data was not exposed).') from None
-        except urllib.error.URLError:
-            raise Error('Network request failed. Check your connection and try again.') from None
-
-    def get(self, url):
-        with self.open(url, {'Prefer': 'redeemSharingLinkIfNecessary'}) as response:
-            return json.load(response)
-
-    def root(self):
-        with self.open(self.share) as response:
-            response.read(1024)
-        token = 'u!' + base64.urlsafe_b64encode(self.share.encode()).decode().rstrip('=')
-        return self.get(f'{self.api}/shares/{token}/driveItem?ump=1')
-
-    def item_url(self, item):
-        drive = urllib.parse.quote(item['parentReference']['driveId'], safe='')
-        ident = urllib.parse.quote(item['id'], safe='')
-        return f'{self.api}/drives/{drive}/items/{ident}'
-
-    def children(self, item):
-        url = self.item_url(item) + '/children'
-        result = []
-        while url:
-            data = self.get(url)
-            result.extend(data.get('value', []))
-            url = data.get('@odata.nextLink')
-            if url and (urllib.parse.urlsplit(url).scheme != 'https' or urllib.parse.urlsplit(url).hostname != urllib.parse.urlsplit(self.api).hostname):
-                raise Error('Unexpected API pagination target.')
-        return result
-
-    def folder(self, item, name):
-        matches = [x for x in self.children(item) if x['name'] == name and 'folder' in x]
-        if len(matches) != 1:
-            raise Error(f'Source folder is missing or ambiguous: {name}')
-        return matches[0]
-
-    def catalog(self, countries=COUNTRIES):
-        root = self.folder(self.root(), 'wahooMapsCreator-Maps')
-        folders = self.children(root)
-        result = []
-        release_sets = {}
-        prefixes = {'map': 'Maps Without Contour Lines ', 'routing': 'Routing '}
-        for kind, prefix in prefixes.items():
-            candidates = {}
-            for folder in folders:
-                match = re.fullmatch(re.escape(prefix) + r'([A-Za-z]+)-(20\d{2})', folder['name'])
-                if match and match[1].lower() in MONTHS and 'folder' in folder:
-                    candidates[(int(match[2]), MONTHS[match[1].lower()])] = folder
-            if not candidates:
-                raise Error(f'No dated source folder found for {kind}.')
-            release_sets[kind] = candidates
-        common = set(release_sets['map']) & set(release_sets['routing'])
-        if not common:
-            raise Error('No shared map and routing release was found.')
-        stamp = max(common)
-        map_release = release_sets['map'][stamp]
-        route_release = release_sets['routing'][stamp]
-        for kind in ('map', 'routing'):
-            release = release_sets[kind][stamp]
-            files = self.children(self.folder(release, 'europe'))
-            for country in countries:
-                name = country + ('-routing' if kind == 'routing' else '') + '.zip'
-                matches = [f for f in files if f.get('name') == name]
-                if len(matches) != 1:
-                    available = sorted(f.get('name', '') for f in files if f.get('name', '').endswith('.zip'))
-                    raise Error(f'Archive is missing or ambiguous: {name} in {release["name"]}/europe. ZIP entries: {json.dumps(available[:30], ensure_ascii=False)}')
-                archive = matches[0]
-                link = archive.get('@microsoft.graph.downloadUrl') or archive.get('@content.downloadUrl')
-                if not link:
-                    # Child listings need not contain transient download annotations.
-                    detail = self.get(self.item_url(archive))
-                    if detail.get('id') != archive['id'] or detail.get('name') != name:
-                        raise Error(f'Archive details do not match the listing: {name}')
-                    archive = {**archive, **detail}
-                    link = archive.get('@microsoft.graph.downloadUrl') or archive.get('@content.downloadUrl')
-                if 'file' not in archive or not link:
-                    facet = 'yes' if 'file' in archive else 'no'
-                    raise Error(f'Archive found: {name}; download link is missing after lookup or the entry is not a file (file field: {facet}).')
-                parsed = urllib.parse.urlsplit(link)
-                if parsed.scheme != 'https' and not (parsed.scheme == 'http' and self.api.startswith('http://127.0.0.1:') and parsed.hostname == '127.0.0.1'):
-                    raise Error(f'Unsafe download protocol for {name}.')
-                result.append({**archive, '@microsoft.graph.downloadUrl': link, 'kind': kind, 'country': country, 'release': map_release['name'], 'map_release': map_release['name'], 'routing_release': route_release['name']})
-        return result
-
-    def catalog_europe(self, progress_callback=None):
-        """Return paired map/routing archives from one shared Europe release."""
-        report = progress_callback or (lambda _message: None)
-        report('Connecting to the public OneDrive share …')
-        root = self.folder(self.root(), 'wahooMapsCreator-Maps')
-        folders = self.children(root)
-        report('Finding the latest shared map and routing release …')
-        releases = {}
-        for kind, prefix in [('map', 'Maps Without Contour Lines '), ('routing', 'Routing ')]:
-            candidates = {}
-            for folder in folders:
-                match = re.fullmatch(re.escape(prefix) + r'([A-Za-z]+)-(20\d{2})', folder['name'])
-                if match and match[1].lower() in MONTHS and 'folder' in folder:
-                    stamp = (int(match[2]), MONTHS[match[1].lower()])
-                    candidates[stamp] = folder
-            releases[kind] = candidates
-        common = set(releases['map']) & set(releases['routing'])
-        if not common:
-            raise Error('No shared map and routing release was found for Europe.')
-        stamp = max(common)
-        map_release, route_release = releases['map'][stamp], releases['routing'][stamp]
-        report('Reading paired Europe archives and modification dates …')
-        map_files = self.children(self.folder(map_release, 'europe'))
-        route_files = self.children(self.folder(route_release, 'europe'))
-        maps = {f['name'][:-4].lower(): f for f in map_files if re.fullmatch(r'[a-z]+(?:-[a-z]+)*\.zip', f.get('name', '')) and 'file' in f}
-        routes = {f['name'][:-12].lower(): f for f in route_files if re.fullmatch(r'[a-z]+(?:-[a-z]+)*-routing\.zip', f.get('name', '')) and 'file' in f}
-        countries = set(maps) & set(routes)
-        if not countries:
-            raise Error(f'No paired map and routing archives found in {map_release["name"]} / {route_release["name"]}.')
-        preferred = ('germany', 'poland', 'czech-republic', 'denmark')
-        ordered = [c for c in preferred if c in countries] + sorted(countries - set(preferred))
-        result = []
-        for country in ordered:
-            for kind, archive in [('map', maps[country]), ('routing', routes[country])]:
-                link = archive.get('@microsoft.graph.downloadUrl') or archive.get('@content.downloadUrl')
-                if not link:
-                    detail = self.get(self.item_url(archive))
-                    if detail.get('id') != archive['id'] or detail.get('name') != archive['name']:
-                        raise Error(f'Archive details do not match the listing: {archive["name"]}')
-                    archive = {**archive, **detail}
-                    link = archive.get('@microsoft.graph.downloadUrl') or archive.get('@content.downloadUrl')
-                if not link or 'file' not in archive:
-                    raise Error(f'Download link is missing or the entry is not a file: {archive["name"]}')
-                parsed = urllib.parse.urlsplit(link)
-                if parsed.scheme != 'https' and not (parsed.scheme == 'http' and self.api.startswith('http://127.0.0.1:') and parsed.hostname == '127.0.0.1'):
-                    raise Error(f'Unsafe download protocol for {archive["name"]}.')
-                result.append({**archive, '@microsoft.graph.downloadUrl': link, 'kind': kind, 'country': country, 'release': map_release['name'], 'map_release': map_release['name'], 'routing_release': route_release['name']})
-        return result
-
-    def download(self, item, directory):
-        if not isinstance(item.get('size'), int) or item['size'] <= 0:
-            raise Error(f'Invalid archive size: {item.get("name", "(unknown)")}')
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / item['name']
-        meta = target.with_suffix('.json')
-        identity = {k: item.get(k) for k in ('id', 'eTag', 'size', 'release', 'lastModifiedDateTime')}
-        if target.exists() and meta.exists():
-            old = json.loads(meta.read_text())
-            if old.get('source') == identity and target.stat().st_size == item['size'] and sha(target) == old.get('sha256'):
-                print(f'Already verified: {item["name"]}', flush=True)
-                return target
-        if shutil.disk_usage(directory).free < item['size'] + 64 * 1024 ** 2:
-            raise Error('Not enough local storage for the download.')
-        partial = target.with_suffix('.zip.part')
-        print(f'Downloading {item["name"]} ({human(item["size"])}) …', flush=True)
-        try:
-            with self.open(item['@microsoft.graph.downloadUrl']) as response, partial.open('wb') as out:
-                count = 0
-                next_report = max(1, item['size'] // 40)
-                for block in iter(lambda: response.read(1024 * 1024), b''):
-                    count += len(block)
-                    if count > item['size']:
-                        raise Error('Download is larger than announced.')
-                    out.write(block)
-                    if count >= next_report:
-                        width = 24
-                        filled = min(width, int(width * count / item['size']))
-                        print(f'\r  [{"#" * filled}{"-" * (width - filled)}] {100 * count / item["size"]:5.1f}%  {human(count)} / {human(item["size"])}', end='', flush=True)
-                        next_report += max(1, item['size'] // 40)
-                print(f'\r  [{"#" * 24}] 100.0%  {human(count)} / {human(item["size"])}', flush=True)
-            if count != item['size']:
-                raise Error('Download is incomplete.')
-            digest = sha(partial)
-            # OneDrive SHA-256, when supplied, adds an independent source check.
-            expected = item.get('file', {}).get('hashes', {}).get('sha256Hash')
-            if expected and digest.lower() != expected.lower():
-                raise Error('Source hash does not match.')
-            partial.replace(target)
-            save_json(meta, {'source': identity, 'sha256': digest})
-            return target
-        finally:
-            partial.unlink(missing_ok=True)
-
-
-def tile_path(name, kind):
-    """Accept only documented numeric tile layouts; preserve provider basenames."""
-    if '\\' in name or '\x00' in name:
-        raise Error(f'Unsafe archive path: {name!r}')
-    parts = name.rstrip('/').split('/')
-    if any(p in ('', '.', '..') for p in parts) or PurePosixPath(name).is_absolute():
-        raise Error(f'Unsafe archive path: {name!r}')
-    # Archives may include the full device hierarchy or just numeric tile paths.
-    prefixes = {'map': ('maps/tiles/8/', 'tiles/8/'), 'routing': ('maps/routing/2/000/', 'routing/2/000/', '2/000/', '000/')}
-    for prefix in prefixes[kind]:
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-    suffix = r'\.map\.lzma(?:\.17)?' if kind == 'map' else r'\.gph\.lzma'
-    match = re.fullmatch(r'(\d{1,3})/(\d{1,3})' + suffix, name)
-    if not match:
-        # Some archives name tiles x.y.map.lzma instead of using x/y paths.
-        match = re.fullmatch(r'(?:(\d{1,3})/)?(\d{1,3})\.(\d{1,3})' + suffix, name)
-        if not match or (match[1] is not None and match[1] != match[2]):
-            raise Error(f'Unknown tile name: {name!r}')
-        x, y = match[2], match[3]
-        relative = f'{x}/{name.rsplit("/", 1)[-1]}'
-    else:
-        x, y = match[1], match[2]
-        relative = name
-    if kind == 'map' and (int(x) > 255 or int(y) > 255):
-        raise Error('Map coordinate is outside zoom level 8.')
-    if kind == 'routing' and (len(x) != 3 or len(y) != 3):
-        raise Error('Routing coordinates must have three digits.')
-    return relative
-
-
-def extract(archive, kind, dest, entries, country='unknown'):
-    with zipfile.ZipFile(archive) as z:
-        infos = z.infolist()
-        files = []
-        for info in infos:
-            mode = info.external_attr >> 16
-            if stat.S_ISLNK(mode) or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)):
-                raise Error('Archive contains links or special files.')
-            # Validate directories too, without trying to interpret them as tiles.
-            raw = info.filename.rstrip('/')
-            if '\\' in raw or '\x00' in raw or any(p in ('', '.', '..') for p in raw.split('/')) or raw.startswith('/'):
-                raise Error('Unsafe archive path.')
-            if not info.is_dir():
-                # The provided country bundles contain zero-byte numbered
-                # version sidecars beside the canonical tile. Ignore only this
-                # observed empty sidecar form; never accept an empty tile.
-                if info.file_size == 0 and re.search(r'\.(?:map|gph)\.lzma\.\d+$', info.filename):
-                    continue
-                relative = tile_path(info.filename, kind)
-                if info.file_size <= 0:
-                    raise Error('Empty tile file.')
-                files.append((info, relative))
-        if not files:
-            raise Error('Empty archive.')
-        expanded = sum(i.file_size for i, _ in files)
-        if expanded > 40 * 1024 ** 3 or shutil.disk_usage(dest).free < expanded + 64 * 1024 ** 2:
-            raise Error('Archive is too large or there is not enough storage to extract it.')
-        extract_step = max(1, len(files) // 40)
-        for index, (info, relative) in enumerate(files, 1):
-            key = f'{kind}/{relative}'
-            target = dest / key
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_name(target.name + '.part')
-            try:
-                with z.open(info) as src, temp.open('wb') as out:
-                    shutil.copyfileobj(src, out, 1024 * 1024)
-                digest = sha(temp)
-                if key in entries and entries[key]['sha256'] != digest:
-                    raise Error(f'Conflicting overlapping tile: {key}')
-                temp.replace(target)
-                if key in entries:
-                    entries[key]['countries'] = sorted(set(entries[key].get('countries', []) + [country]))
-                else:
-                    entries[key] = {'path': key, 'kind': kind, 'relative': relative, 'size': info.file_size, 'sha256': digest, 'countries': [country]}
-            finally:
-                temp.unlink(missing_ok=True)
-            if index % extract_step == 0 or index == len(files):
-                progress(f'Extracting {Path(archive).name}', index, len(files))
-
-
-def prepare(source, data, countries):
-    catalog = source.catalog(countries)
-    show_catalog(catalog)
-    prepared = data / 'prepared'
-    prepared.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix='.prepare-', dir=prepared))
-    entries = {}
-    try:
-        for item in catalog:
-            archive = source.download(item, data / 'downloads')
-            print(f'Verifying and extracting {item["name"]} …', flush=True)
-            extract(archive, item['kind'], stage, entries, item['country'])
-        manifest = {'version': 1, 'countries': list(countries), 'sources': [{k: i[k] for k in ('name', 'size', 'release', 'id')} for i in catalog], 'files': sorted(entries.values(), key=lambda f: f['path'])}
-        save_json(stage / 'manifest.json', manifest)
-        final = prepared / uuid.uuid4().hex
-        stage.rename(final)
-        save_json(data / 'current.json', {'directory': final.name})
-        print(f'Prepared: {len(entries)} files, {human(sum(f["size"] for f in entries.values()))}\n{final}', flush=True)
-        return final
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage)
-
-
-def prepare_catalog(source, data, catalog):
-    if not catalog or len({i['release'] for i in catalog}) != 1:
-        raise Error('Selection does not contain a shared map and routing release.')
-    countries = list(dict.fromkeys(i['country'] for i in catalog))
-    expected = {(c, k) for c in countries for k in ('map', 'routing')}
-    if {(i['country'], i['kind']) for i in catalog} != expected:
-        raise Error('Each country must include both a map and routing archive.')
-    show_catalog(catalog)
-    prepared = data / 'prepared'
-    prepared.mkdir(parents=True, exist_ok=True)
-    run_id = uuid.uuid4().hex
-    stage = prepared / ('.prepare-' + run_id)
-    final = prepared / run_id
-    stage.mkdir()
-    downloads = data / 'downloads'
-    print(f'ZIP downloads: {downloads}\nTemporary extraction and verification: {stage}\nAfter verification: {final}', flush=True)
-    entries = {}
-    try:
-        for item in catalog:
-            archive = source.download(item, downloads)
-            print(f'Verifying and extracting {item["name"]} …', flush=True)
-            extract(archive, item['kind'], stage, entries, item['country'])
-        manifest = {'version': 1, 'countries': countries, 'sources': [{k: i.get(k) for k in ('name', 'size', 'release', 'map_release', 'routing_release', 'lastModifiedDateTime', 'id')} for i in catalog], 'files': sorted(entries.values(), key=lambda f: f['path'])}
-        save_json(stage / 'manifest.json', manifest)
-        stage.rename(final)
-        save_json(data / 'current.json', {'directory': final.name})
-        total = sum(f['size'] for f in entries.values())
-        print(f'Prepared: {len(entries)} files, {human(total)}\n{final}', flush=True)
-        return final
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage)
-
-
-def load_prepared(data):
-    pointer = json.loads((data / 'current.json').read_text())['directory']
-    if not re.fullmatch(r'[a-f0-9]{32}', pointer):
-        raise Error('Invalid preparation pointer.')
-    folder = data / 'prepared' / pointer
-    manifest = json.loads((folder / 'manifest.json').read_text())
-    if not isinstance(manifest, dict) or manifest.get('version') != 1 or not manifest.get('files'):
-        raise Error('Invalid or empty manifest.')
-    validate_prepared_files(folder, manifest)
-    return folder, manifest
-
-
-def validate_prepared_files(folder, manifest):
-    """Reject missing, changed, or unsafe tiles in a prepared set."""
-    seen = set()
-    for f in manifest['files']:
-        if not isinstance(f, dict):
-            raise Error('Invalid tile entry in prepared manifest.')
-        kind, relative, path = f.get('kind'), f.get('relative'), f.get('path')
-        if (kind not in ROOTS or not isinstance(relative, str) or tile_path(relative, kind) != relative
-                or path != f'{kind}/{relative}' or path in seen
-                or not isinstance(f.get('size'), int) or f['size'] <= 0
-                or not isinstance(f.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', f['sha256'])):
-            raise Error('Invalid or duplicate target path in manifest.')
-        seen.add(path)
-        local = folder / path
-        parents = list(local.parents)
-        if (folder.is_symlink() or not local.is_file() or local.is_symlink()
-                or any(parent.is_symlink() for parent in parents if parent == folder or folder in parent.parents)
-                or local.stat().st_size != f['size'] or sha(local) != f['sha256']):
-            raise Error(f'Prepared file has changed: {path}')
-
-
-def current_prepared_summary(data):
-    pointer_path = data / 'current.json'
-    try:
-        if pointer_path.is_symlink() or not pointer_path.is_file():
-            return None
-        pointer = json.loads(pointer_path.read_text()).get('directory', '')
-        if not re.fullmatch(r'[a-f0-9]{32}', pointer):
-            return None
-        folder = data / 'prepared' / pointer
-        manifest_path = folder / 'manifest.json'
-        if folder.is_symlink() or manifest_path.is_symlink() or not manifest_path.is_file():
-            return None
-        manifest = json.loads(manifest_path.read_text())
-        files = manifest.get('files', [])
-        if manifest.get('version') != 1 or not files:
-            return None
-        return {'countries': manifest.get('countries', []), 'files': len(files), 'bytes': sum(int(f['size']) for f in files)}
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def sync_journals(data):
-    """Read retained journals, representing unreadable entries explicitly."""
-    runs = data / 'runs'
-    if runs.is_symlink():
-        raise Error('The sync journal directory is a symlink; device writes are blocked until it is restored.')
-    if not runs.exists():
-        return []
-    if not runs.is_dir():
-        raise Error('The sync journal path is not a directory; device writes are blocked until it is restored.')
-    journals = []
-    for run_dir in sorted(runs.iterdir()):
-        if not run_dir.is_dir() or run_dir.is_symlink():
-            continue
-        journal_path = run_dir / 'journal.json'
-        if not journal_path.exists() and not journal_path.is_symlink():
-            continue
-        try:
-            if journal_path.is_symlink() or not journal_path.is_file():
-                raise ValueError('journal is not a regular file')
-            journal = json.loads(journal_path.read_text())
-            if not isinstance(journal, dict) or not isinstance(journal.get('serial'), str) or not journal.get('serial') or not isinstance(journal.get('status'), str) or not journal.get('status'):
-                raise ValueError('journal has an invalid schema')
-            journals.append((journal_path, journal))
-        except (OSError, ValueError, TypeError, UnicodeError):
-            journals.append((journal_path, {'_corrupt_journal': True, 'status': 'unreadable'}))
-    return journals
-
-
-def pending_syncs(data, serial):
-    pending = []
-    for journal_path, journal in sync_journals(data):
-        if journal.get('_corrupt_journal'):
-            # The device serial cannot be trusted or read, so fail closed for
-            # every device using this data directory.
-            pending.append((journal_path, {**journal, 'serial': serial}))
-        elif journal.get('serial') == serial and journal.get('status') not in TERMINAL_JOURNAL_STATES:
-            # Any durable nonterminal state may be a hard-aborted process.
-            pending.append((journal_path, journal))
-    return pending
-
-
-def pending_resume_info(data, pending):
-    """Return a verified prepared set and journals that cannot resume from it."""
-    resumable = []
-    unresumable = []
-    damaged_prepared_files = False
-    for journal_path, journal in pending:
-        if journal.get('_corrupt_journal'):
-            unresumable.append((journal_path, journal))
-            continue
-        prepared_id = journal.get('prepared_id')
-        manifest_hash = journal.get('manifest_sha256')
-        if not isinstance(prepared_id, str) or not re.fullmatch(r'[a-f0-9]{32}', prepared_id) or not isinstance(manifest_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', manifest_hash):
-            unresumable.append((journal_path, journal))
-            continue
-        folder = data / 'prepared' / prepared_id
-        manifest_path = folder / 'manifest.json'
-        try:
-            if folder.is_symlink() or not folder.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file() or sha(manifest_path) != manifest_hash:
-                unresumable.append((journal_path, journal))
-                continue
-            manifest = json.loads(manifest_path.read_text())
-            if not isinstance(manifest, dict):
-                unresumable.append((journal_path, journal))
-                continue
-            files = manifest.get('files', [])
-            if manifest.get('version') != 1 or not files:
-                unresumable.append((journal_path, journal))
-                continue
-            try:
-                validate_prepared_files(folder, manifest)
-            except (Error, OSError, ValueError, TypeError, KeyError):
-                damaged_prepared_files = True
-                unresumable.append((journal_path, journal))
-                continue
-            resumable.append((journal_path, journal, prepared_id, manifest_hash, manifest))
-        except (OSError, ValueError, TypeError, AttributeError, KeyError):
-            unresumable.append((journal_path, journal))
-    keys = {(item[2], item[3]) for item in resumable}
-    if len(keys) > 1:
-        return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'More than one prepared set has an unfinished sync.'
-    if any(journal.get('_corrupt_journal') for _, journal in unresumable):
-        return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'One or more sync journals are unreadable or malformed; their device state cannot be determined.'
-    if damaged_prepared_files:
-        return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'One or more prepared tile files are missing, changed, or unsafe; this sync cannot be resumed from verified local data.'
-    if not resumable:
-        return None, unresumable, None
-    _, _, prepared_id, manifest_hash, manifest = resumable[0]
-    summary = {'countries': manifest.get('countries', []), 'files': len(manifest['files']), 'bytes': sum(int(f['size']) for f in manifest['files'])}
-    return (prepared_id, manifest_hash, summary), unresumable, None
-
-
-def archive_unbound_legacy_syncs(data, serial):
-    """Archive pre-manifest journals automatically; they cannot be resumed."""
-    archived = 0
-    for journal_path, journal in pending_syncs(data, serial):
-        if journal.get('_corrupt_journal'):
-            continue
-        if journal.get('prepared_id') is None and journal.get('manifest_sha256') is None:
-            journal['previous_status'] = journal.get('status')
-            journal['status'] = 'orphaned_legacy'
-            journal['archived_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
-            save_json(journal_path, journal)
-            archived += 1
-    return archived
-
-
-def resolve_unresumable_syncs(journals):
-    """Keep unresolved history while explicitly clearing the retry gate."""
-    resolved = []
-    for journal_path, journal in journals:
-        if journal.get('_corrupt_journal'):
-            base = journal_path.with_name('journal.acknowledged-corrupt.json')
-            destination = base
-            suffix = 2
-            while destination.exists() or destination.is_symlink():
-                destination = base.with_name(f'journal.acknowledged-corrupt-{suffix}.json')
-                suffix += 1
-            os.replace(journal_path, destination)
-            resolved.append(destination)
-        else:
-            journal['previous_status'] = journal.get('status')
-            journal['status'] = 'acknowledged_unresumable'
-            journal['acknowledged_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
-            save_json(journal_path, journal)
-            resolved.append(journal_path)
-    return resolved
-
-
-def mark_retried_syncs(data, serial, manifest_hash, run_id):
-    for journal_path, journal in pending_syncs(data, serial):
-        if journal.get('manifest_sha256') == manifest_hash:
-            journal['status'] = 'recovered'
-            journal['recovered_by'] = run_id
-            save_json(journal_path, journal)
-
-
-def cleanup_after_success(data):
-    """Clean completed-run data without breaking another device's retry."""
-    errors = []
-    runs = data / 'runs'
-    retained_prepared = set()
-    retain_all_prepared = False
-    journals = sync_journals(data)
-    for _, journal in journals:
-        if journal.get('_corrupt_journal'):
-            retain_all_prepared = True
-        elif journal.get('status') not in TERMINAL_JOURNAL_STATES:
-            prepared_id = journal.get('prepared_id')
-            if isinstance(prepared_id, str) and re.fullmatch(r'[a-f0-9]{32}', prepared_id):
-                retained_prepared.add(prepared_id)
-            else:
-                retain_all_prepared = True
-
-    for path in (data / 'current.json', data / 'downloads'):
-        try:
-            if path.is_symlink() or path.is_file():
-                path.unlink(missing_ok=True)
-            elif path.is_dir():
-                shutil.rmtree(path)
-        except OSError:
-            errors.append(str(path))
-
-    prepared = data / 'prepared'
-    if prepared.is_dir() and not prepared.is_symlink():
-        for path in prepared.iterdir():
-            try:
-                if retain_all_prepared or path.name in retained_prepared:
-                    continue
-                if path.is_symlink() or path.is_file():
-                    path.unlink(missing_ok=True)
-                elif path.is_dir():
-                    shutil.rmtree(path)
-            except OSError:
-                errors.append(str(path))
-        try:
-            prepared.rmdir()
-        except OSError:
-            pass
-
-    if runs.is_dir() and not runs.is_symlink():
-        for path in list(runs.iterdir()):
-            journal_path = path / 'journal.json'
-            try:
-                if path.is_dir() and not path.is_symlink() and journal_path.exists():
-                    entry = next((journal for source, journal in journals if source == journal_path), None)
-                    if entry is None or entry.get('_corrupt_journal'):
-                        continue
-                    status = entry.get('status')
-                    payload = path / 'payload'
-                    if status == 'complete':
-                        shutil.rmtree(path)
-                    elif status in TERMINAL_JOURNAL_STATES and payload.is_dir() and not payload.is_symlink():
-                        shutil.rmtree(payload)
-            except (OSError, ValueError, TypeError, AttributeError):
-                errors.append(str(path))
-        try:
-            runs.rmdir()
-        except OSError:
-            pass
-    return errors
-
+from map_core import Error, ROOTS, human, progress, save_json, sha
+from map_preparation import extract, inspect_current_prepared, load_prepared, prepare_catalog, tile_path
+from map_source import API, SHARE, UA, Source, archive_date, show_catalog
+from sync_recovery import (
+    TERMINAL_JOURNAL_STATES, archive_unbound_legacy_syncs, cleanup_after_success,
+    mark_retried_syncs, pending_resume_info, pending_syncs, resolve_unresumable_syncs,
+)
 
 class ADB:
     def __init__(self, executable='adb', serial=None):
@@ -780,7 +156,6 @@ def free_device(adb):
     raise Error('Could not determine free device storage.')
 
 
-
 def ordered_countries(catalog):
     countries = {item['country'] for item in catalog}
     preferred = ('germany', 'poland', 'czech-republic', 'denmark')
@@ -789,14 +164,6 @@ def ordered_countries(catalog):
 
 def default_countries(countries):
     return {'germany'} if 'germany' in countries else ({countries[0]} if countries else set())
-
-
-def archive_date(item):
-    value = item.get('lastModifiedDateTime')
-    try:
-        return dt.date.fromisoformat(value[:10]).strftime('%Y-%m-%d') if value else 'date missing'
-    except (TypeError, ValueError):
-        return 'date missing'
 
 
 def choose_countries(catalog):
@@ -862,6 +229,24 @@ def choose_countries(catalog):
         sys.stdout.flush()
 
 
+def menu_validation_key(data, pending):
+    """Key cached tile validation to the local pointer or journal state."""
+    def file_state(path):
+        try:
+            stat = path.lstat()
+            return stat.st_ino, stat.st_mtime_ns, stat.st_size, stat.st_mode
+        except OSError:
+            return None
+
+    if pending:
+        return ('pending', tuple(
+            (str(path), journal.get('status'), journal.get('prepared_id'),
+             journal.get('manifest_sha256'), file_state(path))
+            for path, journal in pending
+        ))
+    return ('current', file_state(data / 'current.json'))
+
+
 def interactive(adb, data):
     print('Connect your ELEMNT BOLT v2: power it on and connect it to your Mac with a USB data cable.')
     print('If ADB reports “unauthorized”: unplug USB, hold Power and both right zoom buttons, reconnect USB, then approve the device prompt.')
@@ -877,23 +262,34 @@ def interactive(adb, data):
     model = props.get('ro.product.model', '(unknown)')
     build = props.get('ro.build.display.id', props.get('ro.build.id', '(unknown)'))
     print(f'Connected: {model} · Build {build} · Serial {adb.serial}')
+    validation_key = None
+    validation_result = None
     while True:
         archived_legacy = archive_unbound_legacy_syncs(data, adb.serial)
         if archived_legacy:
             print(f'\nAutomatically archived {archived_legacy} legacy sync journal(s) without a prepared manifest. They may have left partial tiles on the device; the journal history is retained, and no device files were changed.')
         pending = pending_syncs(data, adb.serial)
-        candidate, unresumable, recovery_problem = pending_resume_info(data, pending)
-        if candidate:
-            prepared_id, _, summary = candidate
-            pointer_path = data / 'current.json'
-            try:
-                current_id = json.loads(pointer_path.read_text()).get('directory') if pointer_path.is_file() and not pointer_path.is_symlink() else None
-            except (OSError, ValueError, TypeError):
-                current_id = None
-            if current_id != prepared_id:
-                save_json(pointer_path, {'directory': prepared_id})
-        else:
-            summary = current_prepared_summary(data) if not pending else None
+        current_key = menu_validation_key(data, pending)
+        if current_key != validation_key:
+            candidate, unresumable, recovery_problem = pending_resume_info(data, pending)
+            prepared_problem = None
+            if candidate:
+                prepared_id, _, summary = candidate
+                pointer_path = data / 'current.json'
+                try:
+                    current_id = json.loads(pointer_path.read_text()).get('directory') if pointer_path.is_file() and not pointer_path.is_symlink() else None
+                except (OSError, ValueError, TypeError):
+                    current_id = None
+                if current_id != prepared_id:
+                    save_json(pointer_path, {'directory': prepared_id})
+            else:
+                summary, prepared_problem = inspect_current_prepared(data) if not pending else (None, None)
+            validation_result = candidate, unresumable, recovery_problem, summary, prepared_problem
+            validation_key = current_key
+        candidate, unresumable, recovery_problem, summary, prepared_problem = validation_result
+        if prepared_problem:
+            print(f'Prepared maps cannot be resumed: {prepared_problem}')
+            print('Choose [1] to prepare a fresh selection; the invalid preparation will not be uploaded.')
         if pending and unresumable:
             detail = recovery_problem or 'Some older journal entries no longer have their prepared files and cannot be retried.'
             print(f'\nRecovery needed: {detail}')
@@ -927,14 +323,20 @@ def interactive(adb, data):
                 total = sum(item['size'] for item in selected_catalog)
                 labels = ', '.join(c.replace('-', ' ').title() for c in selected)
                 print(f'Selection confirmed: {labels}\nMaps: {catalog[0]["map_release"]} · Routing: {catalog[0]["routing_release"]}\nArchives: {len(selected_catalog)} (map + routing per country) · Download: {human(total)}', flush=True)
+                show_catalog(selected_catalog)
                 prepare_catalog(source, data, selected_catalog)
                 sync(data, adb)
             except (Error, OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as e:
                 print(f'Operation failed: {e}\nThe manager remains open.', file=sys.stderr, flush=True)
                 if (data / 'downloads').is_dir():
                     print(f'Verified ZIPs remain in {data / "downloads"}; retries reuse them after checking their hashes.')
-                if current_prepared_summary(data):
-                    print('Prepared files remain available. Choose [2] in the menu to resume.')
+                pending_after = pending_syncs(data, adb.serial)
+                if menu_validation_key(data, pending_after) == validation_key:
+                    cached_candidate, cached_blocked, _, cached_summary, cached_problem = validation_result
+                    if cached_summary and not cached_blocked:
+                        print('Prepared files remain available. Choose [2] in the menu to resume.')
+                    elif cached_problem:
+                        print(f'Prepared files are not resumable: {cached_problem}')
             continue
         if action == '2' and ((candidate and not unresumable) or (summary and not pending)):
             try:
@@ -1086,12 +488,6 @@ def sync(data, adb, confirm=None):
         raise
 
 
-def show_catalog(catalog):
-    for item in catalog:
-        print(f'{item["release"]}: {item["name"]} — {archive_date(item)} · {human(item["size"])}', flush=True)
-    print(f'Total archive size: {human(sum(i["size"] for i in catalog))}', flush=True)
-
-
 def native_adb(executable):
     resolved = shutil.which(executable)
     if not resolved:
@@ -1102,8 +498,9 @@ def native_adb(executable):
             raise Error('ADB is not a native arm64 build; Rosetta is not used.')
     return resolved
 
-
 @contextlib.contextmanager
+
+
 def lock(data):
     import fcntl
     with (data / '.lock').open('a') as f:

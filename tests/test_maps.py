@@ -96,7 +96,7 @@ class FakeDeviceTests(unittest.TestCase):
             remote.parent.mkdir(parents=True, exist_ok=True)
             remote.write_bytes(b'old-' + kind.encode())
             self.originals[remote] = remote.read_bytes()
-        w.save_json(self.folder / 'manifest.json', {'version': 1, 'countries': list(w.COUNTRIES), 'files': entries})
+        w.save_json(self.folder / 'manifest.json', {'version': 1, 'countries': ['germany', 'poland', 'czech-republic'], 'files': entries})
         w.save_json(self.data / 'current.json', {'directory': 'a' * 32})
         self.env = patch.dict(os.environ, {'FAKE_ADB_ROOT': str(self.device), 'FAKE_ADB_FAIL': ''})
         self.env.start()
@@ -574,7 +574,7 @@ class CatalogTests(unittest.TestCase):
         routing = [{**archives[0], 'id': 'route-archive', 'name': 'germany-routing.zip'}]
         details = {'archive': {**archives[0], **annotation}, 'route-archive': {**routing[0], **annotation}}
         with patch.object(source, 'root', return_value={}), patch.object(source, 'folder', return_value=folder), patch.object(source, 'children', side_effect=[releases, [] if missing else archives, routing]), patch.object(source, 'get', side_effect=lambda url: details[url.rsplit('/', 1)[-1]]) as get:
-            result = source.catalog(('germany',))
+            result = source.catalog_europe()
             return result, get
 
     def test_missing_listing_link_fetches_detail(self):
@@ -613,16 +613,16 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
 
     def test_errors_distinguish_missing_archive_and_link(self):
-        with self.assertRaisesRegex(w.Error, 'Archive is missing or ambiguous'):
+        with self.assertRaisesRegex(w.Error, 'No paired map and routing archives'):
             self.catalog({}, missing=True)
-        with self.assertRaisesRegex(w.Error, 'download link is missing after lookup'):
+        with self.assertRaisesRegex(w.Error, 'Download link is missing or the entry is not a file'):
             self.catalog({'webUrl': 'https://fixture/secret'})
 
-    def test_standard_catalog_requires_common_map_and_routing_release(self):
+    def test_europe_catalog_requires_common_map_and_routing_release(self):
         source = w.Source()
         releases = [{'id': 'm', 'name': 'Maps Without Contour Lines January-2099', 'folder': {}}, {'id': 'r', 'name': 'Routing February-2099', 'folder': {}}]
         with patch.object(source, 'root', return_value={}), patch.object(source, 'folder', return_value={}), patch.object(source, 'children', return_value=releases), self.assertRaisesRegex(w.Error, 'shared map and routing release'):
-            source.catalog(('germany',))
+            source.catalog_europe()
 
     def test_archive_dates_are_shown_separately(self):
         self.assertEqual(w.archive_date({'lastModifiedDateTime': '2099-01-09T13:12:28Z'}), '2099-01-09')
@@ -681,6 +681,50 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(run.call_args[0][0], ['/usr/bin/lipo', '-verify_arch', 'arm64', '/fixture/adb'])
 
 
+class PreparedLoadingTests(unittest.TestCase):
+    def test_all_prepared_load_paths_reject_symlink_and_non_file_manifests(self):
+        for kind in ('symlink', 'directory'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                data = Path(temp)
+                prepared_id = 'c' * 32
+                folder = data / 'prepared' / prepared_id
+                tile = folder / 'map/133/84.map.lzma'
+                tile.parent.mkdir(parents=True)
+                tile.write_bytes(b'valid tile')
+                entry = {'path': 'map/133/84.map.lzma', 'kind': 'map', 'relative': '133/84.map.lzma',
+                         'size': tile.stat().st_size, 'sha256': w.sha(tile), 'countries': ['germany']}
+                target = data / 'manifest-target.json'
+                w.save_json(target, {'version': 1, 'countries': ['germany'], 'files': [entry]})
+                expected_hash = w.sha(target)
+                manifest = folder / 'manifest.json'
+                if kind == 'symlink':
+                    manifest.symlink_to(target)
+                else:
+                    manifest.mkdir()
+                w.save_json(data / 'current.json', {'directory': prepared_id})
+
+                with self.assertRaises(w.Error):
+                    w.load_prepared(data)
+                with self.assertRaises(w.Error):
+                    w.load_prepared(data, prepared_id, expected_hash)
+                summary, problem = w.inspect_current_prepared(data)
+                self.assertIsNone(summary)
+                self.assertTrue(problem)
+
+                pending = [(data / 'runs' / 'run' / 'journal.json', {
+                    'prepared_id': prepared_id, 'manifest_sha256': expected_hash,
+                })]
+                candidate, unresumable, _ = w.pending_resume_info(data, pending)
+                self.assertIsNone(candidate)
+                self.assertEqual(len(unresumable), 1)
+
+                adb = w.ADB('unused')
+                with patch.object(adb, 'inspect') as inspect, self.assertRaises(w.Error):
+                    w.sync(data, adb)
+                inspect.assert_not_called()
+
+
+
 class ManagerTests(unittest.TestCase):
     def test_cleanup_preserves_failed_sync_journal(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -704,6 +748,42 @@ class ManagerTests(unittest.TestCase):
                 w.interactive(adb, data)
             self.assertIn('The manager remains open', err.getvalue())
 
+    def test_menu_reuses_preparation_validation_until_local_state_changes(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()) as out:
+            data = Path(temp)
+            prepared = data / 'prepared' / ('d' * 32)
+            tile = prepared / 'map/133/84.map.lzma'
+            tile.parent.mkdir(parents=True)
+            tile.write_bytes(b'unchanged tile')
+            entry = {'path': 'map/133/84.map.lzma', 'kind': 'map', 'relative': '133/84.map.lzma',
+                     'size': tile.stat().st_size, 'sha256': w.sha(tile), 'countries': ['germany']}
+            w.save_json(prepared / 'manifest.json', {'version': 1, 'countries': ['germany'], 'files': [entry]})
+            w.save_json(data / 'current.json', {'directory': prepared.name})
+            adb = w.ADB('unused')
+            with patch.object(adb, 'select'), patch.object(adb, 'inspect', return_value={'ro.product.model': 'ELEMNT-BOLT2'}), patch.object(w, 'inspect_current_prepared', wraps=w.inspect_current_prepared) as inspect, patch('builtins.input', side_effect=['x', 'q']):
+                w.interactive(adb, data)
+        self.assertEqual(inspect.call_count, 1)
+        self.assertEqual(out.getvalue().count('[2] Resume prepared maps'), 2)
+
+    def test_changed_current_prepared_tile_is_not_offered_for_resume(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()) as out:
+            data = Path(temp)
+            prepared = data / 'prepared' / ('a' * 32)
+            tile = prepared / 'map/133/84.map.lzma'
+            tile.parent.mkdir(parents=True)
+            tile.write_bytes(b'original')
+            entry = {'path': 'map/133/84.map.lzma', 'kind': 'map', 'relative': '133/84.map.lzma',
+                     'size': len(b'original'), 'sha256': w.sha(tile), 'countries': ['germany']}
+            w.save_json(prepared / 'manifest.json', {'version': 1, 'countries': ['germany'], 'files': [entry]})
+            w.save_json(data / 'current.json', {'directory': 'a' * 32})
+            tile.write_bytes(b'changed')
+            adb = w.ADB('fake')
+            with patch.object(adb, 'select'), patch.object(adb, 'inspect', return_value={'ro.product.model': 'ELEMNT-BOLT2'}), patch('builtins.input', side_effect=['q']):
+                w.interactive(adb, data)
+        self.assertNotIn('[2] Resume prepared maps', out.getvalue())
+        self.assertIn('Prepared maps cannot be resumed:', out.getvalue())
+        self.assertIn('Choose [1] to prepare a fresh selection', out.getvalue())
+
     def test_sync_error_offers_resume_from_prepared_files(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             data = Path(temp)
@@ -714,12 +794,20 @@ class ManagerTests(unittest.TestCase):
             ]
             prepared = data / 'prepared' / ('a' * 32)
             prepared.mkdir(parents=True)
-            w.save_json(prepared / 'manifest.json', {'version': 1, 'countries': ['germany'], 'files': [{'size': 1}]})
+            entries = []
+            for kind, relative in [('map', '133/84.map.lzma'), ('routing', '123/456.gph.lzma')]:
+                tile = prepared / kind / relative
+                tile.parent.mkdir(parents=True, exist_ok=True)
+                tile.write_bytes(b'valid ' + kind.encode())
+                entries.append({'path': f'{kind}/{relative}', 'kind': kind, 'relative': relative,
+                                'size': tile.stat().st_size, 'sha256': w.sha(tile), 'countries': ['germany']})
+            w.save_json(prepared / 'manifest.json', {'version': 1, 'countries': ['germany'], 'files': entries})
             w.save_json(data / 'current.json', {'directory': 'a' * 32})
-            with patch.object(adb, 'select'), patch.object(adb, 'inspect', return_value={'ro.product.model': 'ELEMNT-BOLT2'}), patch.object(w.Source, 'catalog_europe', return_value=catalog), patch.object(w, 'choose_countries', return_value=['germany']), patch.object(w, 'prepare_catalog', return_value=prepared), patch.object(w, 'sync', side_effect=w.Error('fixture sync failure')), patch('builtins.input', side_effect=['1', 'q']):
+            with patch.object(adb, 'select'), patch.object(adb, 'inspect', return_value={'ro.product.model': 'ELEMNT-BOLT2'}), patch.object(w.Source, 'catalog_europe', return_value=catalog), patch.object(w, 'choose_countries', return_value=['germany']), patch.object(w, 'prepare_catalog', return_value=prepared), patch.object(w, 'sync', side_effect=w.Error('fixture sync failure')), patch.object(w, 'inspect_current_prepared', wraps=w.inspect_current_prepared) as inspect, patch('builtins.input', side_effect=['1', 'q']):
                 w.interactive(adb, data)
             self.assertIn('[2] Resume prepared maps', out.getvalue())
             self.assertIn('Prepared files remain available', out.getvalue())
+            self.assertEqual(inspect.call_count, 1)
 
 
 class HTTPTests(unittest.TestCase):
@@ -793,7 +881,7 @@ class HTTPTests(unittest.TestCase):
             try:
                 base = f'http://127.0.0.1:{server.server_port}'
                 source = w.Source(api=base + '/api', share=base + '/share')
-                catalog = source.catalog(('germany',))
+                catalog = source.catalog_europe()
                 self.assertEqual(len(catalog), 2)
                 with contextlib.redirect_stdout(io.StringIO()):
                     result = source.download(catalog[0], Path(temp))
@@ -862,18 +950,18 @@ class HTTPTests(unittest.TestCase):
         source = w.Source(api='https://fixture/api', share='https://fixture/share')
         with tempfile.TemporaryDirectory() as temp, patch.object(source.opener, 'open', side_effect=transport), contextlib.redirect_stdout(io.StringIO()):
             data = Path(temp)
-            first = w.prepare(source, data, ('germany',))
+            first = w.prepare_catalog(source, data, source.catalog_europe())
             _, manifest = w.load_prepared(data)
             self.assertEqual(len(manifest['files']), 2)
             self.assertEqual(sum('/download/' in url for url in seen), 2)
-            second = w.prepare(source, data, ('germany',))
+            second = w.prepare_catalog(source, data, source.catalog_europe())
             self.assertNotEqual(first, second)
             self.assertEqual(sum('/download/' in url for url in seen), 2)
             self.assertTrue(first.exists())
             # Failure must not publish an incomplete preparation.
             pointer = (data / 'current.json').read_bytes()
-            with patch('wahoo_maps.extract', side_effect=w.Error('broken archive')), self.assertRaises(w.Error):
-                w.prepare(source, data, ('germany',))
+            with patch('map_preparation.extract', side_effect=w.Error('broken archive')), self.assertRaises(w.Error):
+                w.prepare_catalog(source, data, source.catalog_europe())
             self.assertEqual((data / 'current.json').read_bytes(), pointer)
             self.assertFalse(list((data / 'prepared').glob('.prepare-*')))
 
