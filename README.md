@@ -31,13 +31,10 @@ required.
 ## Install from a fresh clone
 
 ```sh
-git clone https://github.com/YOUR-ACCOUNT/wahoo-map-sync.git
+git clone https://github.com/cogidoo/wahoo-map-sync.git
 cd wahoo-map-sync
 ./wahoo-maps --help
 ```
-
-Replace `YOUR-ACCOUNT` with the GitHub user or organization that hosts the
-repository.
 
 There is no package installation step. If `adb` is not on `PATH`, pass its path
 with `--adb`.
