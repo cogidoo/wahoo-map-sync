@@ -71,10 +71,15 @@ delete unselected countries, modify firmware or themes, enable VTM, or change
 If a run stops after preparation, restart the CLI and choose the offered resume
 action. A retry is bound to the prepared manifest from that run and sends the
 selected files again. Failed run journals and prepared files are retained.
-Old journals that predate manifest binding are archived automatically with a
-warning that they may have left partial tiles; no device files are changed by
-that local recovery step. A journal tied to missing or invalid prepared files
-stays blocked rather than being silently discarded.
+Prepared files referenced by any unfinished journal are kept when a different
+device sync succeeds. Old journals that predate manifest binding are archived
+automatically with a warning that they may have left partial tiles; no device
+files are changed by that local recovery step. A journal tied to missing or
+invalid prepared files, or a damaged journal, blocks writes. The manager offers
+`[a] Resolve blocked recovery`; after a separate `y` confirmation, valid journal
+history is marked acknowledged and damaged journal bytes are preserved under a
+new filename. This records the decision and permits a fresh selection, but does
+not repair or change device tiles.
 
 After target hashes pass, the CLI sends Wahoo's `PURGE` and `RELOAD_MAP` cache
 commands. Successful command responses do not by themselves prove that maps

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import sys
 
 root = Path(os.environ['FAKE_ADB_ROOT'])
@@ -64,13 +65,21 @@ elif args[0] == 'shell':
         print('Package [com.wahoofitness.bolt]\n versionName=TEST' if mode != 'package' else 'Unknown package')
     elif ' sha256sum ' in command or command.startswith('sha256sum '):
         paths_text = command.rsplit('sha256sum ', 1)[1]
-        for path in shlex.split(paths_text):
+        paths = shlex.split(paths_text)
+        for index, path in enumerate(paths):
             p = local(path)
             if p.is_symlink() or p.parent.is_symlink() or not p.is_file():
                 sys.exit(10)
-            print(hashlib.sha256(p.read_bytes()).hexdigest(), path)
+            staged = '/.wahoo-sync-' in path
+            if mode == 'hash-missing-final' and not staged:
+                continue
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            if mode == 'hash-wrong-final' and not staged and index == 0:
+                digest = '0' * 64
+            print(digest, path)
     elif command.startswith('if ! ( '):
         pattern = r'if ! \( (.*?) \); then exit 41; fi; mkdir -p (\S+) && mv (\S+) (\S+) \|\| exit 42'
+        rename_count = 0
         for match in re.finditer(pattern, command):
             checks, parent, source, target = match.groups()
             paths = re.findall(r'\[ ! -L (\S+) \]', checks)
@@ -79,10 +88,14 @@ elif args[0] == 'shell':
             target_path = local(target)
             if target_path.is_symlink() or (target_path.exists() and not target_path.is_file()):
                 sys.exit(41)
-            if mode == 'rename':
+            if mode == 'rename' or (mode.startswith('rename-after-') and rename_count >= int(mode.rsplit('-', 1)[1])):
                 sys.exit(42)
             local(parent).mkdir(parents=True, exist_ok=True)
             local(source).replace(target_path)
+            rename_count += 1
+            if mode == 'kill-during-promotion' and rename_count == 3:
+                os.kill(int(os.environ['FAKE_ADB_PARENT_PID']), signal.SIGKILL)
+                sys.exit()
         if not list(re.finditer(pattern, command)):
             sys.exit(11)
     elif command.startswith('rm -rf '):

@@ -80,9 +80,18 @@ Pre-manifest legacy journals with neither a prepared ID nor a manifest hash are
 automatically retained as `orphaned_legacy`, with their previous status and an
 automated warning about possible partial device tiles. This local recovery
 does not touch the device and does not block a new selection. A journal bound
-to a manifest whose prepared files are missing or invalid stays pending. Do not
-silently archive that state. Failed journals remain for audit; a successful
-retry marks matching runs recovered and removes reconstructible payload data.
+to a manifest whose prepared files are missing or invalid stays pending. The
+interactive `[a] Resolve blocked recovery` action requires a separate `y`,
+retains valid journal contents under an acknowledged state, and renames damaged
+journals without changing their bytes. It never changes device files. Any
+unreadable journal blocks writes for the shared data directory because its
+device serial cannot be trusted.
+
+After success, cleanup removes only prepared sets no pending journal references
+across all serials. It retains the complete run directory and payload for every
+nonterminal journal. A corrupt journal makes cleanup retain all prepared sets
+until the journal is explicitly resolved. Recovered and acknowledged journals
+remain for audit; their reconstructible payloads can be removed.
 
 The tool must not remove unselected countries, modify firmware or themes, alter
 VTM settings, touch `routing-config.json`, or clear unrelated files in

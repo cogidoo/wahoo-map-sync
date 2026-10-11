@@ -31,7 +31,10 @@ whether the implementation remains appropriately small.
 - Journals bind a run to the prepared directory and manifest hash. Hard-aborted
   nonterminal states are pending. Pre-manifest legacy journals without either
   binding field are automatically retained as `orphaned_legacy`; journals with
-  a binding but missing/invalid prepared content remain pending.
+  a binding but missing/invalid prepared content remain pending. Corrupt
+  journals block writes until explicitly acknowledged, with the damaged bytes
+  retained. Successful cleanup preserves prepared data and payloads referenced
+  by unfinished journals for any device.
 - Tests use synthetic ZIPs, offline HTTP fixtures, and a filesystem-backed fake
   ADB. One localhost HTTP test may skip if socket binding is prohibited.
 

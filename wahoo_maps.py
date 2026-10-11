@@ -26,6 +26,7 @@ UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/
 COUNTRIES = ('germany', 'poland', 'czech-republic')
 ROOTS = {'map': '/sdcard/maps/tiles/8', 'routing': '/sdcard/maps/routing/2/000'}
 MONTHS = {m.lower(): i for i, m in enumerate(('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'), 1)}
+TERMINAL_JOURNAL_STATES = ('complete', 'recovered', 'legacy_acknowledged', 'orphaned_legacy', 'acknowledged_unresumable')
 
 
 class Error(Exception):
@@ -392,18 +393,31 @@ def load_prepared(data):
         raise Error('Invalid preparation pointer.')
     folder = data / 'prepared' / pointer
     manifest = json.loads((folder / 'manifest.json').read_text())
-    if manifest.get('version') != 1 or not manifest.get('files'):
+    if not isinstance(manifest, dict) or manifest.get('version') != 1 or not manifest.get('files'):
         raise Error('Invalid or empty manifest.')
+    validate_prepared_files(folder, manifest)
+    return folder, manifest
+
+
+def validate_prepared_files(folder, manifest):
+    """Reject missing, changed, or unsafe tiles in a prepared set."""
     seen = set()
     for f in manifest['files']:
-        kind = f['kind']
-        if kind not in ROOTS or tile_path(f['relative'], kind) != f['relative'] or f['path'] != f'{kind}/{f["relative"]}' or f['path'] in seen:
+        if not isinstance(f, dict):
+            raise Error('Invalid tile entry in prepared manifest.')
+        kind, relative, path = f.get('kind'), f.get('relative'), f.get('path')
+        if (kind not in ROOTS or not isinstance(relative, str) or tile_path(relative, kind) != relative
+                or path != f'{kind}/{relative}' or path in seen
+                or not isinstance(f.get('size'), int) or f['size'] <= 0
+                or not isinstance(f.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', f['sha256'])):
             raise Error('Invalid or duplicate target path in manifest.')
-        seen.add(f['path'])
-        local = folder / f['path']
-        if any(p.is_symlink() for p in (folder, local.parent, local)) or not local.is_file() or local.stat().st_size != f['size'] or sha(local) != f['sha256']:
-            raise Error(f'Prepared file has changed: {f["path"]}')
-    return folder, manifest
+        seen.add(path)
+        local = folder / path
+        parents = list(local.parents)
+        if (folder.is_symlink() or not local.is_file() or local.is_symlink()
+                or any(parent.is_symlink() for parent in parents if parent == folder or folder in parent.parents)
+                or local.stat().st_size != f['size'] or sha(local) != f['sha256']):
+            raise Error(f'Prepared file has changed: {path}')
 
 
 def current_prepared_summary(data):
@@ -427,21 +441,44 @@ def current_prepared_summary(data):
         return None
 
 
+def sync_journals(data):
+    """Read retained journals, representing unreadable entries explicitly."""
+    runs = data / 'runs'
+    if runs.is_symlink():
+        raise Error('The sync journal directory is a symlink; device writes are blocked until it is restored.')
+    if not runs.exists():
+        return []
+    if not runs.is_dir():
+        raise Error('The sync journal path is not a directory; device writes are blocked until it is restored.')
+    journals = []
+    for run_dir in sorted(runs.iterdir()):
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            continue
+        journal_path = run_dir / 'journal.json'
+        if not journal_path.exists() and not journal_path.is_symlink():
+            continue
+        try:
+            if journal_path.is_symlink() or not journal_path.is_file():
+                raise ValueError('journal is not a regular file')
+            journal = json.loads(journal_path.read_text())
+            if not isinstance(journal, dict) or not isinstance(journal.get('serial'), str) or not journal.get('serial') or not isinstance(journal.get('status'), str) or not journal.get('status'):
+                raise ValueError('journal has an invalid schema')
+            journals.append((journal_path, journal))
+        except (OSError, ValueError, TypeError, UnicodeError):
+            journals.append((journal_path, {'_corrupt_journal': True, 'status': 'unreadable'}))
+    return journals
+
+
 def pending_syncs(data, serial):
     pending = []
-    runs = data / 'runs'
-    if not runs.is_dir() or runs.is_symlink():
-        return pending
-    for run_dir in runs.iterdir():
-        journal_path = run_dir / 'journal.json'
-        try:
-            if run_dir.is_dir() and not run_dir.is_symlink() and journal_path.is_file() and not journal_path.is_symlink():
-                journal = json.loads(journal_path.read_text())
-                # Any durable nonterminal state may be a hard-aborted process.
-                if journal.get('serial') == serial and journal.get('status') not in ('complete', 'recovered', 'legacy_acknowledged', 'orphaned_legacy'):
-                    pending.append((journal_path, journal))
-        except (OSError, ValueError, TypeError):
-            continue
+    for journal_path, journal in sync_journals(data):
+        if journal.get('_corrupt_journal'):
+            # The device serial cannot be trusted or read, so fail closed for
+            # every device using this data directory.
+            pending.append((journal_path, {**journal, 'serial': serial}))
+        elif journal.get('serial') == serial and journal.get('status') not in TERMINAL_JOURNAL_STATES:
+            # Any durable nonterminal state may be a hard-aborted process.
+            pending.append((journal_path, journal))
     return pending
 
 
@@ -449,7 +486,11 @@ def pending_resume_info(data, pending):
     """Return a verified prepared set and journals that cannot resume from it."""
     resumable = []
     unresumable = []
+    damaged_prepared_files = False
     for journal_path, journal in pending:
+        if journal.get('_corrupt_journal'):
+            unresumable.append((journal_path, journal))
+            continue
         prepared_id = journal.get('prepared_id')
         manifest_hash = journal.get('manifest_sha256')
         if not isinstance(prepared_id, str) or not re.fullmatch(r'[a-f0-9]{32}', prepared_id) or not isinstance(manifest_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', manifest_hash):
@@ -462,16 +503,29 @@ def pending_resume_info(data, pending):
                 unresumable.append((journal_path, journal))
                 continue
             manifest = json.loads(manifest_path.read_text())
+            if not isinstance(manifest, dict):
+                unresumable.append((journal_path, journal))
+                continue
             files = manifest.get('files', [])
             if manifest.get('version') != 1 or not files:
                 unresumable.append((journal_path, journal))
                 continue
+            try:
+                validate_prepared_files(folder, manifest)
+            except (Error, OSError, ValueError, TypeError, KeyError):
+                damaged_prepared_files = True
+                unresumable.append((journal_path, journal))
+                continue
             resumable.append((journal_path, journal, prepared_id, manifest_hash, manifest))
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
             unresumable.append((journal_path, journal))
     keys = {(item[2], item[3]) for item in resumable}
     if len(keys) > 1:
         return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'More than one prepared set has an unfinished sync.'
+    if any(journal.get('_corrupt_journal') for _, journal in unresumable):
+        return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'One or more sync journals are unreadable or malformed; their device state cannot be determined.'
+    if damaged_prepared_files:
+        return None, unresumable + [(path, journal) for path, journal, *_ in resumable], 'One or more prepared tile files are missing, changed, or unsafe; this sync cannot be resumed from verified local data.'
     if not resumable:
         return None, unresumable, None
     _, _, prepared_id, manifest_hash, manifest = resumable[0]
@@ -483,6 +537,8 @@ def archive_unbound_legacy_syncs(data, serial):
     """Archive pre-manifest journals automatically; they cannot be resumed."""
     archived = 0
     for journal_path, journal in pending_syncs(data, serial):
+        if journal.get('_corrupt_journal'):
+            continue
         if journal.get('prepared_id') is None and journal.get('manifest_sha256') is None:
             journal['previous_status'] = journal.get('status')
             journal['status'] = 'orphaned_legacy'
@@ -490,6 +546,28 @@ def archive_unbound_legacy_syncs(data, serial):
             save_json(journal_path, journal)
             archived += 1
     return archived
+
+
+def resolve_unresumable_syncs(journals):
+    """Keep unresolved history while explicitly clearing the retry gate."""
+    resolved = []
+    for journal_path, journal in journals:
+        if journal.get('_corrupt_journal'):
+            base = journal_path.with_name('journal.acknowledged-corrupt.json')
+            destination = base
+            suffix = 2
+            while destination.exists() or destination.is_symlink():
+                destination = base.with_name(f'journal.acknowledged-corrupt-{suffix}.json')
+                suffix += 1
+            os.replace(journal_path, destination)
+            resolved.append(destination)
+        else:
+            journal['previous_status'] = journal.get('status')
+            journal['status'] = 'acknowledged_unresumable'
+            journal['acknowledged_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            save_json(journal_path, journal)
+            resolved.append(journal_path)
+    return resolved
 
 
 def mark_retried_syncs(data, serial, manifest_hash, run_id):
@@ -501,9 +579,23 @@ def mark_retried_syncs(data, serial, manifest_hash, run_id):
 
 
 def cleanup_after_success(data):
-    """Remove temporary map data and completed run journals, retain failures."""
+    """Clean completed-run data without breaking another device's retry."""
     errors = []
-    for path in (data / 'current.json', data / 'downloads', data / 'prepared'):
+    runs = data / 'runs'
+    retained_prepared = set()
+    retain_all_prepared = False
+    journals = sync_journals(data)
+    for _, journal in journals:
+        if journal.get('_corrupt_journal'):
+            retain_all_prepared = True
+        elif journal.get('status') not in TERMINAL_JOURNAL_STATES:
+            prepared_id = journal.get('prepared_id')
+            if isinstance(prepared_id, str) and re.fullmatch(r'[a-f0-9]{32}', prepared_id):
+                retained_prepared.add(prepared_id)
+            else:
+                retain_all_prepared = True
+
+    for path in (data / 'current.json', data / 'downloads'):
         try:
             if path.is_symlink() or path.is_file():
                 path.unlink(missing_ok=True)
@@ -511,17 +603,37 @@ def cleanup_after_success(data):
                 shutil.rmtree(path)
         except OSError:
             errors.append(str(path))
-    runs = data / 'runs'
+
+    prepared = data / 'prepared'
+    if prepared.is_dir() and not prepared.is_symlink():
+        for path in prepared.iterdir():
+            try:
+                if retain_all_prepared or path.name in retained_prepared:
+                    continue
+                if path.is_symlink() or path.is_file():
+                    path.unlink(missing_ok=True)
+                elif path.is_dir():
+                    shutil.rmtree(path)
+            except OSError:
+                errors.append(str(path))
+        try:
+            prepared.rmdir()
+        except OSError:
+            pass
+
     if runs.is_dir() and not runs.is_symlink():
-        for path in runs.iterdir():
+        for path in list(runs.iterdir()):
             journal_path = path / 'journal.json'
             try:
-                if path.is_dir() and not path.is_symlink() and journal_path.is_file() and not journal_path.is_symlink():
-                    status = json.loads(journal_path.read_text()).get('status')
+                if path.is_dir() and not path.is_symlink() and journal_path.exists():
+                    entry = next((journal for source, journal in journals if source == journal_path), None)
+                    if entry is None or entry.get('_corrupt_journal'):
+                        continue
+                    status = entry.get('status')
                     payload = path / 'payload'
                     if status == 'complete':
                         shutil.rmtree(path)
-                    elif payload.is_dir() and not payload.is_symlink():
+                    elif status in TERMINAL_JOURNAL_STATES and payload.is_dir() and not payload.is_symlink():
                         shutil.rmtree(payload)
             except (OSError, ValueError, TypeError, AttributeError):
                 errors.append(str(path))
@@ -559,11 +671,17 @@ class ADB:
         return self.run('shell', command)
 
     def select(self, serial=None):
-        rows = self.run('devices', '-l').splitlines()
+        previous_serial = self.serial
+        self.serial = None
+        try:
+            rows = self.run('devices', '-l').splitlines()
+        except Error:
+            self.serial = previous_serial
+            raise
         authorized = [r.split()[0] for r in rows if len(r.split()) >= 2 and r.split()[1] == 'device']
         if serial is None:
             if len(authorized) != 1:
-                raise Error('Connect exactly one authorized device, or use --serial. Hold Power and both zoom buttons, then connect USB.')
+                raise Error('Connect and authorize exactly one device. If it is not listed, hold Power and both zoom buttons while reconnecting USB.')
             serial = authorized[0]
         if serial not in authorized or not re.fullmatch(r'[A-Za-z0-9_.:-]+', serial):
             raise Error('Serial number is missing or the device is not authorized.')
@@ -779,13 +897,14 @@ def interactive(adb, data):
         if pending and unresumable:
             detail = recovery_problem or 'Some older journal entries no longer have their prepared files and cannot be retried.'
             print(f'\nRecovery needed: {detail}')
-            print('Those runs may have left partial tiles on the device. Acknowledge them only if you want to keep that state and allow a fresh map selection.')
+            print('These runs may have left partial tiles on the device. Use [a] to keep their journal history and explicitly allow a fresh selection; this does not change device files.')
         resume = ''
         if candidate and not unresumable:
             resume = f'  [2] Resume interrupted maps ({", ".join(summary["countries"])}; {summary["files"]} files)'
         elif summary and not pending:
             resume = f'  [2] Resume prepared maps ({", ".join(summary["countries"])}; {summary["files"]} files)'
-        print(f'\nActions: [1] Write maps{resume}  [q] Quit')
+        resolve = '  [a] Resolve blocked recovery' if pending and unresumable else ''
+        print(f'\nActions: [1] Write maps{resume}{resolve}  [q] Quit')
         action = input('Select: ').strip().lower()
         if action in ('q', 'quit', 'exit'):
             return
@@ -794,7 +913,7 @@ def interactive(adb, data):
                 if candidate and not unresumable:
                     print('An unfinished sync is tied to this prepared map set. Choose [2] to retry it first.')
                 elif unresumable:
-                    print('This sync cannot be resumed from local files. Its journal remains pending; restore its prepared files or resolve the journal before starting a new selection.')
+                    print('This sync cannot be resumed from local files. Choose [a] to record the unresolved state before starting a new selection.')
                 continue
             try:
                 source = Source()
@@ -823,6 +942,13 @@ def interactive(adb, data):
                 sync(data, adb)
             except (Error, OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as e:
                 print(f'Resume failed: {e}\nPrepared files and the sync journal are retained.', file=sys.stderr, flush=True)
+            continue
+        if action == 'a' and pending and unresumable:
+            if input('Acknowledge unresolved recovery, retain its history, and allow a fresh selection? [y/N] ').strip().lower() == 'y':
+                resolved = resolve_unresumable_syncs(unresumable)
+                print(f'Resolved {len(resolved)} blocked journal(s). Their history was retained; possible partial device tiles remain unchanged.')
+            else:
+                print('Recovery was not acknowledged; no changes were made.')
             continue
         print('Invalid selection.')
 
@@ -853,12 +979,14 @@ def sync(data, adb, confirm=None):
                 raise Error('Unsafe device target directory.')
     changes = [{**f, 'remote': ROOTS[f['kind']] + '/' + f['relative']} for f in manifest['files']]
     manifest_hash = sha(folder / 'manifest.json')
-    if any(journal.get('manifest_sha256') != manifest_hash for _, journal in pending_syncs(data, adb.serial)):
+    pending = pending_syncs(data, adb.serial)
+    if any(journal.get('_corrupt_journal') for _, journal in pending):
+        raise Error('An unreadable sync journal blocks writes. Return to the manager and use [a] to retain and acknowledge its recovery state.')
+    if any(journal.get('manifest_sha256') != manifest_hash for _, journal in pending):
         raise Error('An unfinished sync for this device belongs to a different prepared manifest; retry that prepared set before writing another selection.')
     needed = sum(f['size'] for f in changes) + (max((f['size'] for f in changes), default=0)) + 64 * 1024 ** 2
     available = free_device(adb)
     print(f'To upload: {len(changes)} files, {human(sum(f["size"] for f in changes))}\nDevice free: {human(available)}; conservative requirement: {human(needed)}', flush=True)
-    pending = pending_syncs(data, adb.serial)
     stale_stages = [path for _, old in pending for path in old.get('stage_parents', [])]
     if available < needed and not stale_stages:
         raise Error('Not enough free device storage.')

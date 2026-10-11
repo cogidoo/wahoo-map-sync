@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -76,14 +78,22 @@ class FakeDeviceTests(unittest.TestCase):
         self.folder.mkdir(parents=True)
         entries = []
         self.originals = {}
-        for kind, rel in [('map', '133/84.map.lzma'), ('routing', '123/456.gph.lzma')]:
+        tiles = [
+            ('map', '133/84.map.lzma'),
+            ('map', '133/85.map.lzma'),
+            ('map', '133/86.map.lzma'),
+            ('map', '133/87.map.lzma'),
+            ('routing', '123/456.gph.lzma'),
+            ('routing', '123/457.gph.lzma'),
+        ]
+        for kind, rel in tiles:
             path = f'{kind}/{rel}'
             f = self.folder / path
-            f.parent.mkdir(parents=True)
+            f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(b'new-' + kind.encode())
             entries.append({'path': path, 'relative': rel, 'kind': kind, 'sha256': w.sha(f), 'size': f.stat().st_size})
             remote = self.device / (w.ROOTS[kind] + '/' + rel).lstrip('/')
-            remote.parent.mkdir(parents=True)
+            remote.parent.mkdir(parents=True, exist_ok=True)
             remote.write_bytes(b'old-' + kind.encode())
             self.originals[remote] = remote.read_bytes()
         w.save_json(self.folder / 'manifest.json', {'version': 1, 'countries': list(w.COUNTRIES), 'files': entries})
@@ -164,6 +174,115 @@ class FakeDeviceTests(unittest.TestCase):
         self.assertEqual(self.journals()[-1]['completed'], [])
         self.assertFalse(any('am broadcast' in c[-1] for c in self.calls()))
 
+    def test_partial_promotion_failure_keeps_journal_and_retry_repairs_every_tile(self):
+        manifest = w.load_prepared(self.data)[1]
+        with patch.dict(os.environ, {'FAKE_ADB_FAIL': 'rename-after-3'}), self.assertRaises(w.Error):
+            self.run_sync()
+        journal = self.journals()[0]
+        self.assertEqual(journal['status'], 'failed')
+        self.assertEqual(journal['completed'], [])
+        for index, entry in enumerate(manifest['files']):
+            target = self.device / (w.ROOTS[entry['kind']] + '/' + entry['relative']).lstrip('/')
+            expected = (self.folder / entry['path']).read_bytes() if index < 3 else self.originals[target]
+            self.assertEqual(target.read_bytes(), expected)
+        self.assertFalse(any('am broadcast' in c[-1] for c in self.calls()))
+
+        self.run_sync()
+
+        self.assertEqual(self.journals()[0]['status'], 'recovered')
+        for entry in manifest['files']:
+            target = self.device / (w.ROOTS[entry['kind']] + '/' + entry['relative']).lstrip('/')
+            self.assertEqual(w.sha(target), entry['sha256'])
+
+    def test_hard_killed_process_during_promotion_is_recovered_on_retry(self):
+        repo = Path(__file__).resolve().parents[1]
+        fake_adb = str(Path(__file__).with_name('fake_adb.py'))
+        script = (
+            'import os, pathlib, sys; os.environ["FAKE_ADB_PARENT_PID"] = str(os.getpid()); import wahoo_maps as w; '
+            'w.sync(pathlib.Path(sys.argv[1]), w.ADB(sys.argv[2], serial="TEST123"), confirm=lambda _: "y")'
+        )
+        env = os.environ.copy()
+        env.update({
+            'PYTHONPATH': str(repo),
+            'FAKE_ADB_ROOT': str(self.device),
+            'FAKE_ADB_FAIL': 'kill-during-promotion',
+        })
+        process = subprocess.Popen(
+            [sys.executable, '-c', script, str(self.data), fake_adb],
+            cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        process.communicate(timeout=30)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        journal = self.journals()[0]
+        self.assertEqual(journal['status'], 'promotion')
+        manifest = w.load_prepared(self.data)[1]
+        for index, entry in enumerate(manifest['files']):
+            target = self.device / (w.ROOTS[entry['kind']] + '/' + entry['relative']).lstrip('/')
+            expected = (self.folder / entry['path']).read_bytes() if index < 3 else self.originals[target]
+            self.assertEqual(target.read_bytes(), expected)
+
+        self.run_sync()
+
+        self.assertEqual(self.journals()[0]['status'], 'recovered')
+        for entry in manifest['files']:
+            target = self.device / (w.ROOTS[entry['kind']] + '/' + entry['relative']).lstrip('/')
+            self.assertEqual(w.sha(target), entry['sha256'])
+
+    def test_missing_and_wrong_final_hashes_keep_journal_and_retry(self):
+        manifest = w.load_prepared(self.data)[1]
+        for failure in ('hash-missing-final', 'hash-wrong-final'):
+            (self.device / 'calls.jsonl').write_text('')
+            with self.subTest(failure=failure), patch.dict(os.environ, {'FAKE_ADB_FAIL': failure}), self.assertRaises(w.Error):
+                self.run_sync()
+            self.assertTrue(any(journal['status'] == 'failed' for journal in self.journals()))
+            self.assertFalse(any('am broadcast' in c[-1] for c in self.calls()))
+            self.run_sync(keep_artifacts=True)
+            self.assertTrue(any(journal['status'] == 'recovered' for journal in self.journals()))
+            for entry in manifest['files']:
+                target = self.device / (w.ROOTS[entry['kind']] + '/' + entry['relative']).lstrip('/')
+                self.assertEqual(w.sha(target), entry['sha256'])
+
+    def test_sync_preserves_unselected_tiles_themes_and_routing_config(self):
+        controls = {
+            self.device / 'sdcard/maps/tiles/8/200/10.map.lzma': b'unselected map tile',
+            self.device / 'sdcard/maps/routing/2/000/900/10.gph.lzma': b'unselected routing tile',
+            self.device / 'sdcard/maps/themes/custom.theme': b'user theme',
+            self.device / 'sdcard/maps/routing/2/routing-config.json': b'{"keep": true}',
+        }
+        for path, value in controls.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(value)
+
+        self.run_sync()
+
+        for path, value in controls.items():
+            self.assertEqual(path.read_bytes(), value)
+
+    def test_successful_device_a_sync_preserves_device_b_recovery_data(self):
+        device_b_id = 'b' * 32
+        device_b_folder = self.data / 'prepared' / device_b_id
+        shutil.copytree(self.folder, device_b_folder)
+        manifest = json.loads((device_b_folder / 'manifest.json').read_text())
+        manifest['countries'] = ['denmark']
+        w.save_json(device_b_folder / 'manifest.json', manifest)
+        manifest_hash = w.sha(device_b_folder / 'manifest.json')
+        run_b = self.data / 'runs' / 'device-b-interrupted'
+        run_b.mkdir(parents=True)
+        w.save_json(run_b / 'journal.json', {
+            'serial': 'DEVICE_B', 'status': 'promotion', 'prepared_id': device_b_id,
+            'manifest_sha256': manifest_hash, 'stage_parents': [], 'files': [], 'completed': [],
+        })
+        payload_marker = run_b / 'payload' / 'marker'
+        payload_marker.parent.mkdir()
+        payload_marker.write_bytes(b'recovery payload')
+
+        self.run_sync()
+
+        self.assertTrue((device_b_folder / 'manifest.json').is_file())
+        self.assertTrue(payload_marker.is_file())
+        self.assertEqual(json.loads((run_b / 'journal.json').read_text())['status'], 'promotion')
+        self.assertFalse(self.folder.exists())
+
     def test_missing_final_roots_are_created_before_staging_and_preserve_layout(self):
         for kind in w.ROOTS:
             remote_root = self.device / w.ROOTS[kind].lstrip('/')
@@ -225,7 +344,7 @@ class FakeDeviceTests(unittest.TestCase):
         with patch.dict(os.environ, {'FAKE_ADB_FAIL': 'cache'}), self.assertRaises(w.Error):
             self.run_sync()
         self.assertEqual(self.journals()[0]['status'], 'failed')
-        self.assertEqual(len(self.journals()[0]['completed']), 2)
+        self.assertEqual(len(self.journals()[0]['completed']), 6)
 
     def test_each_cache_broadcast_failure_is_reported_and_stops_progression(self):
         for failure, expected in (('cache-purge', 1), ('cache-reload_map', 2)):
@@ -372,12 +491,78 @@ class FakeDeviceTests(unittest.TestCase):
         })
         self.adb.serial = None
         output = io.StringIO()
-        with patch('builtins.input', side_effect=['q']), contextlib.redirect_stdout(output):
+        with patch('builtins.input', side_effect=['1', 'q']), contextlib.redirect_stdout(output):
             w.interactive(self.adb, self.data)
         result = json.loads((run_dir / 'journal.json').read_text())
         self.assertEqual(result['status'], 'failed')
         self.assertIn('Recovery needed:', output.getvalue())
+        self.assertIn('[a] Resolve blocked recovery', output.getvalue())
         self.assertTrue(w.pending_syncs(self.data, 'TEST123'))
+
+        recovery_output = io.StringIO()
+        with patch('builtins.input', side_effect=['a', 'y', 'q']), contextlib.redirect_stdout(recovery_output):
+            w.interactive(self.adb, self.data)
+        result = json.loads((run_dir / 'journal.json').read_text())
+        self.assertIn('Resolved 1 blocked journal', recovery_output.getvalue())
+        self.assertEqual(result['status'], 'acknowledged_unresumable')
+        self.assertFalse(w.pending_syncs(self.data, 'TEST123'))
+
+    def test_missing_or_damaged_prepared_tile_offers_blocked_recovery(self):
+        manifest_hash = w.sha(self.folder / 'manifest.json')
+        tile = self.folder / 'map/133/84.map.lzma'
+        original = tile.read_bytes()
+        for index, damage in enumerate(('missing', 'changed')):
+            tile.write_bytes(original)
+            run_dir = self.data / 'runs' / f'damaged-prepared-{index}'
+            run_dir.mkdir(parents=True)
+            w.save_json(run_dir / 'journal.json', {
+                'serial': 'TEST123', 'status': 'promotion', 'prepared_id': self.folder.name,
+                'manifest_sha256': manifest_hash, 'files': [], 'completed': [],
+            })
+            if damage == 'missing':
+                tile.unlink()
+            else:
+                tile.write_bytes(b'changed tile')
+
+            output = io.StringIO()
+            with patch('builtins.input', side_effect=['1', 'q']), contextlib.redirect_stdout(output):
+                w.interactive(self.adb, self.data)
+            self.assertIn('prepared tile files are missing, changed, or unsafe', output.getvalue())
+            self.assertIn('[a] Resolve blocked recovery', output.getvalue())
+            self.assertFalse(any(call[2] == 'push' for call in self.calls() if len(call) > 2))
+
+            with patch('builtins.input', side_effect=['a', 'y', 'q']), contextlib.redirect_stdout(io.StringIO()):
+                w.interactive(self.adb, self.data)
+            result = json.loads((run_dir / 'journal.json').read_text())
+            self.assertEqual(result['status'], 'acknowledged_unresumable')
+
+    def test_corrupt_journals_block_writes_until_explicitly_acknowledged(self):
+        invalid_journals = {}
+        for name, content in (('bad-json', b'{invalid'), ('bad-schema', b'{"serial":"TEST123"}')):
+            run_dir = self.data / 'runs' / name
+            run_dir.mkdir(parents=True)
+            journal_path = run_dir / 'journal.json'
+            journal_path.write_bytes(content)
+            invalid_journals[journal_path] = content
+        self.adb.serial = None
+        output = io.StringIO()
+        with patch('builtins.input', side_effect=['1', 'q']), contextlib.redirect_stdout(output):
+            w.interactive(self.adb, self.data)
+        self.assertIn('unreadable or malformed', output.getvalue())
+        self.assertIn('[a] Resolve blocked recovery', output.getvalue())
+        self.assertEqual(len(w.pending_syncs(self.data, 'TEST123')), 2)
+        self.assertFalse(any(call[2] == 'push' for call in self.calls() if len(call) > 2))
+
+        recovery_output = io.StringIO()
+        with patch('builtins.input', side_effect=['a', 'y', 'q']), contextlib.redirect_stdout(recovery_output):
+            w.interactive(self.adb, self.data)
+
+        self.assertIn('Resolved 2 blocked journal', recovery_output.getvalue())
+        for old_path, content in invalid_journals.items():
+            preserved = list(old_path.parent.glob('journal.acknowledged-corrupt*.json'))
+            self.assertEqual(len(preserved), 1)
+            self.assertEqual(preserved[0].read_bytes(), content)
+        self.assertFalse(w.pending_syncs(self.data, 'TEST123'))
 
 
 class CatalogTests(unittest.TestCase):
@@ -466,6 +651,13 @@ class CatalogTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_no_device_message_does_not_recommend_unsupported_serial_option(self):
+        adb = w.ADB('fake')
+        with patch.object(adb, 'run', return_value='List of devices attached\n'), self.assertRaises(w.Error) as raised:
+            adb.select()
+        self.assertIn('Connect and authorize exactly one device', str(raised.exception))
+        self.assertNotIn('--serial', str(raised.exception))
+
     def test_country_order_and_default_selection(self):
         catalog = [{'country': c} for c in ('austria', 'denmark', 'germany', 'poland', 'czech-republic')]
         countries = w.ordered_countries(catalog)
@@ -498,8 +690,8 @@ class ManagerTests(unittest.TestCase):
             complete = runs / 'complete-run'
             failed.mkdir(parents=True)
             complete.mkdir()
-            w.save_json(failed / 'journal.json', {'status': 'failed'})
-            w.save_json(complete / 'journal.json', {'status': 'complete'})
+            w.save_json(failed / 'journal.json', {'serial': 'TEST', 'status': 'failed'})
+            w.save_json(complete / 'journal.json', {'serial': 'TEST', 'status': 'complete'})
             self.assertEqual(w.cleanup_after_success(data), [])
             self.assertTrue((failed / 'journal.json').is_file())
             self.assertFalse(complete.exists())
