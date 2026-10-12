@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from map_core import Error, human, save_json, sha
+from map_core import Error, PREFERRED_COUNTRIES, human, save_json, sha
 
 SHARE = 'https://1drv.ms/f/s!AgQ5_SDAjeL0eIUfrjTBE8QWGZc?e=RrEqBF'
 API = 'https://onedrive.live.com/_api/v2.0'
@@ -94,8 +94,7 @@ class Source:
         countries = set(maps) & set(routes)
         if not countries:
             raise Error(f'No paired map and routing archives found in {map_release["name"]} / {route_release["name"]}.')
-        preferred = ('germany', 'poland', 'czech-republic', 'denmark')
-        ordered = [c for c in preferred if c in countries] + sorted(countries - set(preferred))
+        ordered = [c for c in PREFERRED_COUNTRIES if c in countries] + sorted(countries - set(PREFERRED_COUNTRIES))
         result = []
         for country in ordered:
             for kind, archive in [('map', maps[country]), ('routing', routes[country])]:

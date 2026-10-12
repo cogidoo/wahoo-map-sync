@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 ROOTS = {'map': '/sdcard/maps/tiles/8', 'routing': '/sdcard/maps/routing/2/000'}
+PREFERRED_COUNTRIES = ('germany', 'poland', 'czech-republic', 'denmark')
 
 
 class Error(Exception):

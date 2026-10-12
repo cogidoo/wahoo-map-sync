@@ -47,9 +47,11 @@ with `--adb`.
 ./wahoo-maps --adb /path/to/platform-tools/adb
 ```
 
-Connect and authorize the BOLT v2 over USB. The CLI selects one ADB device,
-checks the Wahoo app and reported model/build, and lists countries that have
-paired map and routing archives in a shared release. Germany is preselected.
+Connect and authorize the BOLT v2 over USB. If multiple ADB devices are
+connected, the CLI automatically selects a uniquely identified BOLT v2. If it
+cannot identify exactly one, disconnect the other devices and retry. It checks
+the Wahoo app and reported model/build, and lists countries that have paired
+map and routing archives in a shared release. Germany is preselected.
 Use the arrow keys to move, Space to select or clear a country, and Enter to
 confirm. The CLI displays archive dates, download size, destination device,
 serial, and available storage before asking `Write maps now? [y/N]`. Only `y`

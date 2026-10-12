@@ -10,8 +10,8 @@ dependencies without a clear need.
 ## Safety invariants
 
 - Preparation and inspection must never write to a connected device.
-- Select one authorized ADB device explicitly and pin later commands to its
-  serial.
+- Select the sole authorized ADB device or uniquely identify a BOLT v2 among
+  multiple authorized devices. Pin later commands to its serial.
 - Verify the Wahoo app and display the reported model and build. Do not silently
   treat a generic Android device, BOLT v1, or BOLT v3 as a BOLT v2.
 - Show the selected device and serial, then require an interactive `y` before

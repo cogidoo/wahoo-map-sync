@@ -12,13 +12,23 @@ import sys
 import uuid
 import zipfile
 
-from map_core import Error, ROOTS, human, progress, save_json, sha
+from map_core import Error, PREFERRED_COUNTRIES, ROOTS, human, progress, save_json, sha
 from map_preparation import extract, inspect_current_prepared, load_prepared, prepare_catalog, tile_path
 from map_source import API, SHARE, UA, Source, archive_date, show_catalog
 from sync_recovery import (
     TERMINAL_JOURNAL_STATES, archive_unbound_legacy_syncs, cleanup_after_success,
     mark_retried_syncs, pending_resume_info, pending_syncs, resolve_unresumable_syncs,
 )
+
+
+def is_known_bolt_v2(props):
+    model = re.sub(r'[^A-Z0-9]', '', props.get('ro.product.model', '').upper())
+    device = re.sub(r'[^A-Z0-9]', '', props.get('ro.product.device', '').upper())
+    return model == 'ELEMNTBOLT2' or (
+        device == 'BOLT2P0'
+        and 'wahoo' in props.get('ro.product.manufacturer', '').lower()
+    )
+
 
 class ADB:
     def __init__(self, executable='adb', serial=None):
@@ -46,42 +56,60 @@ class ADB:
             raise Error('No device selected.')
         return self.run('shell', command)
 
-    def select(self, serial=None):
+    def properties(self):
+        return {
+            key: self.shell(f'getprop {key}')
+            for key in (
+                'ro.product.model', 'ro.product.manufacturer',
+                'ro.product.device', 'ro.build.display.id',
+            )
+        }
+
+    def select(self):
         previous_serial = self.serial
         self.serial = None
         try:
             rows = self.run('devices', '-l').splitlines()
+            authorized = [
+                fields[0] for row in rows
+                if len(fields := row.split()) >= 2 and fields[1] == 'device'
+            ]
+            if not authorized:
+                raise Error(
+                    'No authorized ADB device found. Connect and authorize your '
+                    'ELEMNT BOLT v2, then retry.'
+                )
+            if len(authorized) == 1:
+                selected = authorized[0]
+            else:
+                bolt_devices = []
+                for serial in authorized:
+                    self.serial = serial
+                    if is_known_bolt_v2(self.properties()):
+                        bolt_devices.append(serial)
+                if len(bolt_devices) != 1:
+                    raise Error(
+                        'Could not identify exactly one ELEMNT BOLT v2 among '
+                        'the authorized ADB devices. Disconnect other devices '
+                        'and retry.'
+                    )
+                selected = bolt_devices[0]
+            if not re.fullmatch(r'[A-Za-z0-9_.:-]+', selected):
+                raise Error('ADB reported an invalid device serial.')
+            self.serial = selected
+            return selected
         except Error:
             self.serial = previous_serial
             raise
-        authorized = [r.split()[0] for r in rows if len(r.split()) >= 2 and r.split()[1] == 'device']
-        if serial is None:
-            if len(authorized) != 1:
-                raise Error('Connect and authorize exactly one device. If it is not listed, hold Power and both zoom buttons while reconnecting USB.')
-            serial = authorized[0]
-        if serial not in authorized or not re.fullmatch(r'[A-Za-z0-9_.:-]+', serial):
-            raise Error('Serial number is missing or the device is not authorized.')
-        self.serial = serial
-        return serial
 
     def inspect(self):
-        props = {key: self.shell(f'getprop {key}') for key in ('ro.product.model', 'ro.product.manufacturer', 'ro.product.device', 'ro.build.display.id')}
+        props = self.properties()
         package = self.shell('dumpsys package com.wahoofitness.bolt')
         if not re.search(r'Package \[com\.wahoofitness\.bolt\]', package) or not re.search(r'versionName=\S+', package):
             raise Error('Could not verify the Wahoo app; sync is blocked.')
         version = re.search(r'versionName=(\S+)', package)[1]
         print(f'Device: {self.serial}\nModel: {props["ro.product.model"]}\nManufacturer: {props["ro.product.manufacturer"]}\nProduct: {props["ro.product.device"]}\nBuild: {props["ro.build.display.id"]}\nWahoo app: {version}', flush=True)
         return props
-
-    def digest(self, remote):
-        # Only generated, numeric tile paths are passed here.
-        parent = remote.rsplit('/', 1)[0]
-        out = self.shell(f'if [ -L {parent} ] || [ -L {remote} ]; then echo UNSAFE; elif [ -f {remote} ]; then sha256sum {remote}; elif [ -e {remote} ]; then echo UNSAFE; else echo MISSING; fi')
-        if out == 'MISSING':
-            return None
-        if not re.fullmatch(r'[a-fA-F0-9]{64}\s+\*?' + re.escape(remote), out):
-            raise Error('Device hash is unavailable or the target path is unsafe; sync aborted.')
-        return out.split()[0].lower()
 
     def ensure_directory(self, remote):
         """Create a generated remote directory one component at a time."""
@@ -139,7 +167,7 @@ class ADB:
                 if on_batch:
                     on_batch(promoted)
             except Error as error:
-                raise Error('Could not safely promote staged map files; the previous tile set may be partly updated.') from error
+                raise Error(f'Could not safely promote staged map files: {error} The previous tile set may be partly updated.') from error
 
     def remove_stage(self, remote):
         if not re.fullmatch(r'/sdcard/maps/(?:tiles|routing/2)/\.wahoo-sync-[0-9-]+-[a-f0-9]{8}', remote):
@@ -158,8 +186,7 @@ def free_device(adb):
 
 def ordered_countries(catalog):
     countries = {item['country'] for item in catalog}
-    preferred = ('germany', 'poland', 'czech-republic', 'denmark')
-    return [c for c in preferred if c in countries] + sorted(countries - set(preferred))
+    return [c for c in PREFERRED_COUNTRIES if c in countries] + sorted(countries - set(PREFERRED_COUNTRIES))
 
 
 def default_countries(countries):
@@ -206,6 +233,8 @@ def choose_countries(catalog):
                 sys.stdout.write('  … more countries below\r\n')
             sys.stdout.flush()
             key = sys.stdin.read(1)
+            if key in ('', '\x04'):
+                return None
             if key == '\x1b':
                 sequence = sys.stdin.read(2)
                 if sequence == '[A':
@@ -365,8 +394,7 @@ def sync(data, adb, confirm=None):
     if not sys.stdin.isatty() and confirm is None:
         raise Error('Sync requires an interactive terminal.')
     ask = confirm or input
-    known_bolt2 = model == 'ELEMNTBOLT2' or (device == 'BOLT2P0' and 'wahoo' in props.get('ro.product.manufacturer', '').lower())
-    if not known_bolt2:
+    if not is_known_bolt_v2(props):
         print('The reported properties do not uniquely identify a BOLT v2.', flush=True)
         if ask('Confirm this is a Wahoo ELEMNT BOLT v2? [y/N] ').strip().lower() != 'y':
             raise Error('BOLT v2 identity was not confirmed; nothing was written.')
@@ -386,12 +414,22 @@ def sync(data, adb, confirm=None):
         raise Error('An unreadable sync journal blocks writes. Return to the manager and use [a] to retain and acknowledge its recovery state.')
     if any(journal.get('manifest_sha256') != manifest_hash for _, journal in pending):
         raise Error('An unfinished sync for this device belongs to a different prepared manifest; retry that prepared set before writing another selection.')
-    needed = sum(f['size'] for f in changes) + (max((f['size'] for f in changes), default=0)) + 64 * 1024 ** 2
+    upload_size = sum(f['size'] for f in changes)
+    needed = upload_size + 64 * 1024 ** 2
     available = free_device(adb)
-    print(f'To upload: {len(changes)} files, {human(sum(f["size"] for f in changes))}\nDevice free: {human(available)}; conservative requirement: {human(needed)}', flush=True)
+    print(
+        f'To upload: {len(changes)} files, {human(upload_size)}\n'
+        f'Device free: {human(available)}; requirement including 64 MiB '
+        f'safety margin: {human(needed)}',
+        flush=True,
+    )
     stale_stages = [path for _, old in pending for path in old.get('stage_parents', [])]
     if available < needed and not stale_stages:
-        raise Error('Not enough free device storage.')
+        raise Error(
+            f'Not enough free device storage: {human(upload_size)} upload plus '
+            f'a 64 MiB safety margin requires {human(needed)}, but only '
+            f'{human(available)} is available.'
+        )
     if available < needed:
         print('Temporary data from an unfinished sync can be reclaimed after confirmation.', flush=True)
     if ask('Write maps now? [y/N] ').strip().lower() != 'y':
@@ -418,7 +456,12 @@ def sync(data, adb, confirm=None):
         if stale_stages:
             print(f'Device free after temporary-data cleanup: {human(available)}.', flush=True)
         if available < needed:
-            raise Error('Not enough free device storage after reclaiming failed-run temporary data.')
+            raise Error(
+                'Not enough free device storage after reclaiming failed-run '
+                f'temporary data: {human(upload_size)} upload plus a 64 MiB '
+                f'safety margin requires {human(needed)}, but only '
+                f'{human(available)} is available.'
+            )
         # Validate the complete local selection before beginning either device write.
         for f in changes:
             local = folder / f['path']

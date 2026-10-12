@@ -55,8 +55,11 @@ is `~/Library/Application Support/wahoo-map-sync`; `--data-dir` overrides it.
 
 ## Device transfer and recovery
 
-The CLI selects one authorized ADB serial, verifies the Wahoo app and reports
-device properties, then requires `Write maps now? [y/N]`. Only `y` begins writes.
+The CLI selects the sole authorized ADB serial, or identifies exactly one
+known BOLT v2 among multiple authorized devices. If it cannot uniquely identify
+the BOLT, it asks the user to disconnect other devices and retry. It verifies
+the Wahoo app and reports device properties, then requires
+`Write maps now? [y/N]`. Only `y` begins writes.
 Reject known incompatible models; ambiguous identities need an explicit BOLT v2
 confirmation. Pin every later ADB operation to the selected serial.
 

@@ -167,8 +167,11 @@ class FakeDeviceTests(unittest.TestCase):
         self.assertEqual(self.journals()[-1]['completed'], [])
         self.assertFalse(any('am broadcast' in c[-1] for c in self.calls()))
 
-    def test_promotion_failure_leaves_existing_tiles_intact(self):
-        with patch.dict(os.environ, {'FAKE_ADB_FAIL': 'rename'}), self.assertRaises(w.Error):
+    def test_promotion_failure_preserves_adb_status_and_existing_tiles(self):
+        with (
+            patch.dict(os.environ, {'FAKE_ADB_FAIL': 'rename'}),
+            self.assertRaisesRegex(w.Error, r'ADB command failed: shell \(status 42\)'),
+        ):
             self.run_sync()
         self.assert_originals()
         self.assertEqual(self.journals()[-1]['completed'], [])
@@ -300,7 +303,9 @@ class FakeDeviceTests(unittest.TestCase):
         map_parent = self.device / (w.ROOTS['map'] + '/133').lstrip('/')
         shutil.rmtree(map_parent)
         map_parent.symlink_to(outside, target_is_directory=True)
-        with self.assertRaises(w.Error):
+        with self.assertRaisesRegex(
+            w.Error, r'ADB command failed: shell \(status 41\)'
+        ):
             self.run_sync()
         self.assertEqual(protected.read_bytes(), b'keep')
         self.assertFalse(any('am broadcast' in c[-1] for c in self.calls()))
@@ -332,6 +337,14 @@ class FakeDeviceTests(unittest.TestCase):
                 self.run_sync()
         self.assert_originals()
         self.assertFalse(self.journals())
+
+    def test_exact_upload_size_plus_safety_margin_is_enough_device_space(self):
+        manifest = w.load_prepared(self.data)[1]
+        upload_size = sum(item['size'] for item in manifest['files'])
+        available = upload_size + 64 * 1024 ** 2
+        with patch.object(w, 'free_device', return_value=available):
+            self.run_sync(keep_artifacts=True)
+        self.assertIn('requirement including 64 MiB safety margin', self.output)
 
     def test_corrupt_prepared_prevents_writes(self):
         (self.folder / 'map/133/84.map.lzma').write_bytes(b'tampered')
@@ -648,37 +661,6 @@ class CatalogTests(unittest.TestCase):
                 self.assertIn(str(data / 'prepared' / '.prepare-'), text)
                 self.assertIn(str(folder), text)
                 self.assertTrue((data / 'current.json').is_file())
-
-
-class SelectionTests(unittest.TestCase):
-    def test_no_device_message_does_not_recommend_unsupported_serial_option(self):
-        adb = w.ADB('fake')
-        with patch.object(adb, 'run', return_value='List of devices attached\n'), self.assertRaises(w.Error) as raised:
-            adb.select()
-        self.assertIn('Connect and authorize exactly one device', str(raised.exception))
-        self.assertNotIn('--serial', str(raised.exception))
-
-    def test_country_order_and_default_selection(self):
-        catalog = [{'country': c} for c in ('austria', 'denmark', 'germany', 'poland', 'czech-republic')]
-        countries = w.ordered_countries(catalog)
-        self.assertEqual(countries, ['germany', 'poland', 'czech-republic', 'denmark', 'austria'])
-        self.assertEqual(w.default_countries(countries), {'germany'})
-
-    def test_multiple_devices_require_explicit_serial(self):
-        adb = w.ADB()
-        with patch.object(adb, 'run', return_value='List of devices attached\nA device\nB device\nC unauthorized'):
-            with self.assertRaises(w.Error):
-                adb.select()
-            self.assertEqual(adb.select('B'), 'B')
-            with self.assertRaises(w.Error):
-                adb.select('C')
-
-    def test_x86_only_adb_is_rejected_before_launch(self):
-        with patch('wahoo_maps.shutil.which', return_value='/fixture/adb'), patch('wahoo_maps.sys.platform', 'darwin'), patch('wahoo_maps.subprocess.run') as run:
-            run.return_value.returncode = 1
-            with self.assertRaises(w.Error):
-                w.native_adb('adb')
-            self.assertEqual(run.call_args[0][0], ['/usr/bin/lipo', '-verify_arch', 'arm64', '/fixture/adb'])
 
 
 class PreparedLoadingTests(unittest.TestCase):

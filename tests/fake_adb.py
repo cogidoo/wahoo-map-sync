@@ -116,18 +116,6 @@ elif args[0] == 'shell':
         stale_stage = any(root.rglob('.wahoo-sync-*'))
         low_space = mode == 'space' or (mode == 'space-reclaimable' and stale_stage)
         print('Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/mock 100000000 1 ' + ('1' if low_space else '99999999') + ' 1% /sdcard')
-    elif command.startswith('wc -c < '):
-        print(local(command.split()[-1]).stat().st_size)
-    elif command.startswith('for p in ') and 'echo MISSING; fi; done' in command:
-        paths = shlex.split(command[len('for p in '):].split('; do', 1)[0])
-        for path in paths:
-            p = local(path)
-            if p.is_symlink() or p.parent.is_symlink() or (p.exists() and not p.is_file()):
-                print('UNSAFE')
-            elif p.is_file():
-                print('EXISTS:' + str(p.stat().st_size))
-            else:
-                print('MISSING')
     elif command.startswith('mkdir -p '):
         local(command.split()[-1]).mkdir(parents=True, exist_ok=True)
     elif command.startswith('mv '):
